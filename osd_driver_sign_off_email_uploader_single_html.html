@@ -1,9 +1,23 @@
-<!doctype html>
+# Create a ready-to-deploy **frontend + backend** bundle.
+# - frontend/index.html posts JSON to a backend API (with signature + photos embedded)
+# - server/ (Node/Express) generates a PDF, emails it via SMTP, and saves a copy
+# The code is zipped so you can push to GitHub and deploy backend to Render, frontend to GitHub Pages/Netlify.
+
+import os, zipfile, textwrap, json
+
+root = "/mnt/data/osd_webform"
+frontend_dir = os.path.join(root, "frontend")
+server_dir = os.path.join(root, "server")
+os.makedirs(frontend_dir, exist_ok=True)
+os.makedirs(server_dir, exist_ok=True)
+
+# ---------- Frontend: index.html ----------
+index_html = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>OSD Driver Sign‑Off</title>
+<title>OSD Driver Sign-Off</title>
 <style>
   :root{--ink:#0f172a;--muted:#64748b;--line:#e5e7eb;--brand:#4f46e5}
   body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial;background:#f6f7fb;color:var(--ink);margin:0}
@@ -31,11 +45,11 @@
 </head>
 <body>
 <div class="container">
-  <h1>OSD – Driver Sign‑Off</h1>
+  <h1>OSD – Driver Sign-Off</h1>
 
   <div id="alert"></div>
 
-  <form id="osdForm" class="card" enctype="multipart/form-data">
+  <form id="osdForm" class="card">
     <div class="grid grid-2">
       <div>
         <label>Date/Time</label>
@@ -104,25 +118,24 @@
 
     <div style="margin-top:12px">
       <label>Photos (optional)</label>
-      <input type="file" name="photos" id="photos" multiple accept="image/*"/>
+      <input type="file" id="photos" multiple accept="image/*"/>
       <div class="thumbs" id="thumbs"></div>
     </div>
 
     <div class="row" style="justify-content:flex-end;margin-top:12px">
-      <button type="button" class="btn btn-ghost" id="mailtoBtn">Send via Email App</button>
-      <button class="btn" id="submitBtn">Submit (Email via Form Endpoint)</button>
+      <button class="btn" id="submitBtn">Submit (Generate & Email PDF)</button>
     </div>
-
-    <input type="file" id="sigFile" name="signature" style="display:none"/>
   </form>
 
-  <p class="muted">By default this page emails via a form endpoint (e.g., Formspree). Set your endpoint URL inside the script.</p>
+  <p class="muted">Set your backend URL inside the script to enable PDF emailing.</p>
 </div>
 
 <script>
-  const ACTION_URL = 'https://formspree.io/f/REPLACE_WITH_YOURS';
-  const EMAIL_TO = 'osd@yourcompany.com';
+  // ======== CONFIG ========
+  const BACKEND_URL = 'https://YOUR-RENDER-URL.onrender.com'; // <-- change after backend deploy
+  // ========================
 
+  // Prefill local datetime
   (function(){
     const d = new Date();
     const p = n => String(n).padStart(2,'0');
@@ -130,25 +143,28 @@
     document.getElementById('date').value = val;
   })();
 
+  // Signature pad
   const canvas = document.getElementById('sigCanvas');
   const ctx = canvas.getContext('2d');
-  let drawing = false, last=[0,0];
+  let drawing = false, last=[0,0], signatureDataUrl = '';
   function resize(){
     const ratio = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || canvas.parentElement.clientWidth; const h = 180;
     canvas.width = Math.floor(w * ratio); canvas.height = Math.floor(h * ratio);
     canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
-    ctx.scale(ratio, ratio); ctx.lineWidth = 2.5; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='#111827';
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.lineWidth = 2.5; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle='#111827';
   }
   new ResizeObserver(resize).observe(canvas); resize();
   const pos = e => { const r=canvas.getBoundingClientRect(); const t=e.touches?.[0]; const x=(t?t.clientX:e.clientX)-r.left; const y=(t?t.clientY:e.clientY)-r.top; return [x,y]; };
   const down = e => { e.preventDefault(); drawing=true; last=pos(e)};
   const move = e => { if(!drawing) return; const p=pos(e); ctx.beginPath(); ctx.moveTo(...last); ctx.lineTo(...p); ctx.stroke(); last=p };
-  const up = () => { drawing=false; };
+  const up = () => { drawing=false; signatureDataUrl = canvas.toDataURL('image/png'); };
   canvas.addEventListener('mousedown',down); canvas.addEventListener('mousemove',move); window.addEventListener('mouseup',up);
   canvas.addEventListener('touchstart',down,{passive:false}); canvas.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',up);
-  document.getElementById('clearSig').onclick = () => { ctx.clearRect(0,0,canvas.width,canvas.height); document.getElementById('sigFile').value = '' };
+  document.getElementById('clearSig').onclick = () => { ctx.clearRect(0,0,canvas.width,canvas.height); signatureDataUrl = '' };
 
+  // Photo previews + compression
   const photosInput = document.getElementById('photos');
   const thumbs = document.getElementById('thumbs');
   photosInput.addEventListener('change', () => {
@@ -160,25 +176,34 @@
     });
   });
 
-  async function canvasToFile(){
+  function readImageAsDataURL(file, maxW=1600, maxH=1600, quality=0.85){
     return new Promise(resolve => {
-      canvas.toBlob(blob => {
-        if(!blob) return resolve(null);
-        const file = new File([blob], 'signature.png', { type: 'image/png' });
-        const dt = new DataTransfer(); dt.items.add(file);
-        const sigInput = document.getElementById('sigFile');
-        sigInput.files = dt.files; resolve(file);
-      }, 'image/png');
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const ratio = Math.min(1, maxW/img.width, maxH/img.height);
+          const c = document.createElement('canvas');
+          c.width = Math.round(img.width*ratio);
+          c.height = Math.round(img.height*ratio);
+          const cx = c.getContext('2d');
+          cx.drawImage(img,0,0,c.width,c.height);
+          resolve(c.toDataURL('image/jpeg', quality));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
     });
   }
 
+  // Submit handler -> POST JSON to backend
   document.getElementById('osdForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const alertBox = document.getElementById('alert');
     alertBox.innerHTML='';
 
-    if(!ACTION_URL || ACTION_URL.includes('REPLACE_WITH_YOURS')){
-      alertBox.innerHTML = `<div class="error">Set your form endpoint URL inside the script (ACTION_URL).</div>`; return;
+    if(!BACKEND_URL || BACKEND_URL.includes('YOUR-RENDER-URL')){
+      alertBox.innerHTML = `<div class="error">Set BACKEND_URL inside the script after you deploy the backend.</div>`; return;
     }
 
     const location = document.getElementById('location').value.trim();
@@ -187,29 +212,248 @@
 
     document.getElementById('submitBtn').disabled = true;
 
-    await canvasToFile();
-    const fd = new FormData(document.getElementById('osdForm'));
+    // convert selected photos
+    const files = [...photosInput.files];
+    const photos = [];
+    for(const f of files){ photos.push({ name: f.name, dataUrl: await readImageAsDataURL(f) }); }
 
-    try {
-      const resp = await fetch(ACTION_URL, { method:'POST', body: fd });
-      if(!resp.ok) throw new Error('Submit failed');
-      alertBox.innerHTML = `<div class="success">Submitted! Check your email inbox for this form.</div>`;
+    const payload = {
+      date: document.getElementById('date').value,
+      location,
+      bol: document.getElementById('bol').value,
+      po: document.getElementById('po').value,
+      trailer: document.getElementById('trailer').value,
+      stop: document.getElementById('stop').value,
+      carrier: document.getElementById('carrier').value,
+      vendorId: document.getElementById('vendorId').value,
+      vendorName: document.getElementById('vendorName').value,
+      notes: document.getElementById('notes').value,
+      driverName, driverId: document.getElementById('driverId').value,
+      signatureDataUrl,
+      photos,
+      device: navigator.userAgent,
+      submittedAt: new Date().toISOString()
+    };
+
+    try{
+      const resp = await fetch(BACKEND_URL + '/api/osd/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const out = await resp.json().catch(()=>({}));
+      if(!resp.ok) throw new Error(out.error || 'Submit failed');
+      alertBox.innerHTML = `<div class="success">Submitted! PDF emailed and stored. Ref: ${out.ref || ''}</div>`;
       document.getElementById('osdForm').reset();
-      ctx.clearRect(0,0,canvas.width,canvas.height); thumbs.innerHTML='';
-    } catch (err){
+      ctx.clearRect(0,0,canvas.width,canvas.height); signatureDataUrl=''; thumbs.innerHTML='';
+    }catch(err){
       alertBox.innerHTML = `<div class="error">${err.message}</div>`;
-    } finally {
+    }finally{
       document.getElementById('submitBtn').disabled = false;
     }
-  });
-
-  document.getElementById('mailtoBtn').addEventListener('click', () => {
-    const fields = ['date','location','bol','po','trailer','stop','carrier','vendorId','vendorName','driverName','driverId','notes']
-      .map(id => `${id}: ${document.getElementById(id)?.value||''}`).join('%0D%0A');
-    const subject = encodeURIComponent('OSD Driver Sign‑Off');
-    const body = encodeURIComponent(fields + '\n\n(Attach photos manually if needed.)');
-    window.location.href = `mailto:${encodeURIComponent(EMAIL_TO)}?subject=${subject}&body=${body}`;
   });
 </script>
 </body>
 </html>
+"""
+with open(os.path.join(frontend_dir, "index.html"), "w", encoding="utf-8") as f:
+    f.write(index_html)
+
+# ---------- Backend: package.json ----------
+package_json = {
+  "name": "osd-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.13",
+    "pdfkit": "^0.15.0",
+    "uuid": "^9.0.1"
+  }
+}
+with open(os.path.join(server_dir, "package.json"), "w", encoding="utf-8") as f:
+    json.dump(package_json, f, indent=2)
+
+# ---------- Backend: server.js ----------
+server_js = """import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+import fs from 'fs'
+import path from 'path'
+import nodemailer from 'nodemailer'
+import PDFDocument from 'pdfkit'
+import { v4 as uuidv4 } from 'uuid'
+import { fileURLToPath } from 'url'
+
+dotenv.config()
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+const app = express()
+app.use(cors({ origin: true }))
+app.use(express.json({ limit: '20mb' }))
+
+const OUT_DIR = process.env.OUT_DIR || path.join(__dirname, 'submissions')
+fs.mkdirSync(OUT_DIR, { recursive: true })
+
+app.get('/', (req, res) => res.send('OSD server running'))
+
+app.post('/api/osd/submit', async (req, res) => {
+  try {
+    const data = req.body || {}
+    const ref = uuidv4().slice(0, 8)
+    const pdfPath = path.join(OUT_DIR, `OSD_${ref}.pdf`)
+
+    // Build PDF
+    await buildPDF(data, pdfPath)
+
+    // Email the PDF (if SMTP configured)
+    if (process.env.SMTP_HOST) {
+      const transporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: Number(process.env.SMTP_PORT || 587),
+        secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
+        auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+      })
+      const to = process.env.NOTIFY_TO || process.env.SMTP_USER
+      await transporter.sendMail({
+        from: process.env.MAIL_FROM || process.env.SMTP_USER,
+        to,
+        subject: `OSD Sign-Off ${ref}`,
+        text: `New OSD submission ${ref} from ${data.driverName || 'Driver'} at ${data.location || ''}.`,
+        attachments: [{ filename: `OSD_${ref}.pdf`, path: pdfPath }]
+      })
+    }
+
+    res.json({ ok: true, ref })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: err.message || 'Server error' })
+  }
+})
+
+const PORT = process.env.PORT || 8080
+app.listen(PORT, () => console.log('Server on', PORT))
+
+async function buildPDF(data, filePath) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'LETTER', margin: 40 })
+    const stream = fs.createWriteStream(filePath)
+    doc.pipe(stream)
+
+    doc.fontSize(20).text('OSD – Driver Sign-Off')
+    doc.moveDown(0.5)
+    doc.fontSize(10).fillColor('#475569').text(`Generated: ${new Date().toLocaleString()}`)
+    doc.moveDown()
+    doc.fillColor('#0f172a')
+
+    const row = (label, value='') => {
+      doc.font('Helvetica-Bold').text(label, { continued: true })
+      doc.font('Helvetica').text(' ' + (value || ''))
+    }
+
+    row('Date/Time:', fmtDate(data.date))
+    row('Location:', data.location)
+    row('Load ID / BOL #:', data.bol)
+    row('PO Number:', data.po)
+    row('Trailer #:', data.trailer)
+    row('Stop #:', data.stop)
+    row('Carrier:', data.carrier)
+    row('Vendor ID:', data.vendorId)
+    row('Vendor Name:', data.vendorName)
+
+    doc.moveDown()
+    doc.font('Helvetica-Bold').text('Notes / Exceptions')
+    doc.font('Helvetica').text(data.notes || '(none)')
+    doc.moveDown()
+
+    doc.font('Helvetica-Bold').text('Driver Name: ', { continued: true })
+    doc.font('Helvetica').text(data.driverName || '')
+    doc.font('Helvetica-Bold').text('Driver ID: ', { continued: true })
+    doc.font('Helvetica').text(data.driverId || '')
+    doc.moveDown(0.5)
+
+    if (data.signatureDataUrl) {
+      try {
+        const base64 = data.signatureDataUrl.split(',')[1]
+        const buf = Buffer.from(base64, 'base64')
+        doc.text('Signature:')
+        doc.image(buf, { fit: [420, 120] })
+      } catch { doc.text('(signature failed to render)') }
+    } else {
+      doc.text('(no signature provided)')
+    }
+
+    // Photos page
+    if (Array.isArray(data.photos) && data.photos.length) {
+      doc.addPage().font('Helvetica-Bold').fontSize(16).text('Photos')
+      doc.moveDown()
+      for (const p of data.photos) {
+        const b64 = (p.dataUrl || '').split(',')[1]
+        if (!b64) continue
+        const img = Buffer.from(b64, 'base64')
+        try { doc.image(img, { fit: [520, 280], align: 'center' }) } catch {}
+        doc.moveDown()
+      }
+    }
+
+    doc.end()
+    stream.on('finish', resolve)
+    stream.on('error', reject)
+  })
+}
+
+function fmtDate(s) { try { return new Date(s).toLocaleString() } catch { return '' } }
+"""
+with open(os.path.join(server_dir, "server.js"), "w", encoding="utf-8") as f:
+    f.write(server_js)
+
+# ---------- Backend: .env.example ----------
+env_example = """# OUTPUT DIRECTORY FOR PDFs
+OUT_DIR=./submissions
+
+# SMTP settings (use Gmail/Outlook/SendGrid/Mailgun). For Gmail, create an App Password.
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=YOUR_EMAIL@example.com
+SMTP_PASS=YOUR_APP_PASSWORD
+MAIL_FROM="OSD Bot <YOUR_EMAIL@example.com>"
+NOTIFY_TO=osd@yourcompany.com
+"""
+with open(os.path.join(server_dir, ".env.example"), "w", encoding="utf-8") as f:
+    f.write(env_example)
+
+# ---------- Backend: README ----------
+readme = """# OSD Web Form (PDF + Email)
+
+This repo contains:
+- `frontend/index.html` — Single-file form for drivers to sign on a tablet.
+- `server/` — Node/Express API that generates a PDF and emails it.
+
+## Deploy the Backend (Render)
+1. Create a new GitHub repo and push the `server` folder as its own repo, or select the `server` subfolder in Render when creating a service.
+2. On https://render.com -> New Web Service
+   - Root directory: `server/` (if using monorepo)
+   - Environment: Node
+   - Build command: (auto) `npm install`
+   - Start command: `node server.js`
+3. Add environment variables (copy from `.env.example`). For Gmail use an **App Password**.
+4. Deploy. Note your URL, e.g. `https://osd-backend.onrender.com`.
+
+## Host the Frontend (GitHub Pages or Netlify)
+- GitHub Pages:
+  1. Put `frontend/index.html` in a repo root.
+  2. Settings -> Pages -> Deploy from branch -> `main` / `/root`.
+  3. URL: `https://<username>.github.io/<repo>/`
+- Netlify Drop: drag the `frontend` folder to https://app.netlify.com/drop
+
+## Wire them together
+- Edit `frontend/index.html`, set:
+  ```js
+  const BACKEND_URL = 'https://osd-backend.onrender.com'
+
